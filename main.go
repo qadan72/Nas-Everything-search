@@ -24,8 +24,10 @@ type FileInfo struct {
 	CreateTime string `json:"create_time"`
 }
 
-func initDB() error {
-	db, err := sql.Open("sqlite", "./sql.db?_journal=WAL&_sync=NORMAL&_vacuum=INCREMENTAL")
+func initDB(dbPath string) error {
+	log.Println("初始化数据库...")
+	// 打开数据库文件，如果文件不存在会创建
+	db, err := sql.Open("sqlite", dbPath+"?_journal=WAL&_sync=NORMAL&_vacuum=INCREMENTAL")
 	if err != nil {
 		return err
 	}
@@ -41,7 +43,7 @@ func initDB() error {
 		return fmt.Errorf("启用SQLite优化设置失败: %v", err)
 	}
 
-	// 创建表和索引
+	// 创建表和索引，确保表存在
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS paths (
 			id INTEGER PRIMARY KEY,
@@ -57,10 +59,16 @@ func initDB() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_filename ON files(filename);
 	`)
-	return err
+	if err != nil {
+		return fmt.Errorf("创建表格失败: %v", err)
+	}
+
+	log.Println("数据库初始化完成，表格已创建或已存在")
+	return nil
 }
 
 func processPath(inputPath string) (string, error) {
+	log.Println("处理路径:", inputPath)
 	cleanPath := filepath.ToSlash(inputPath)
 	absPath, err := filepath.Abs(cleanPath)
 	if err != nil {
@@ -74,13 +82,15 @@ func processPath(inputPath string) (string, error) {
 	return filepath.ToSlash(absPath), nil
 }
 
-func scanAndSave(configPath string) {
-	db, err := sql.Open("sqlite", "./sql.db")
+func scanAndSave(configPath, dbPath string, done chan bool) {
+	log.Println("开始扫描文件...")
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
+	// 开始事务
 	tx, err := db.Begin()
 	if err != nil {
 		log.Fatal(err)
@@ -95,7 +105,25 @@ func scanAndSave(configPath string) {
 
 	// 路径缓存
 	pathCache := make(map[string]int64)
+	var totalFiles int64
+	var scannedFiles int64
 
+	// 先遍历一遍，计算文件总数
+	err = filepath.Walk(configPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		totalFiles++
+		return nil
+	})
+	if err != nil {
+		tx.Rollback()
+		log.Fatal(err)
+	}
+
+	log.Printf("文件扫描开始，共需要扫描 %d 个文件\n", totalFiles)
+
+	// 执行文件扫描并保存到数据库
 	err = filepath.Walk(configPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
@@ -123,7 +151,17 @@ func scanAndSave(configPath string) {
 			info.Size(),
 			info.ModTime().Format(time.RFC3339),
 		)
-		return err
+		if err != nil {
+			return err
+		}
+
+		// 更新扫描进度，每30秒输出一次
+		scannedFiles++
+		if scannedFiles%1000 == 0 { // 每1000个文件输出一次进度
+			log.Printf("扫描进度: %d/%d 文件已扫描...\n", scannedFiles, totalFiles)
+		}
+
+		return nil
 	})
 
 	if err != nil {
@@ -136,13 +174,24 @@ func scanAndSave(configPath string) {
 	}
 
 	log.Println("文件扫描完成，数据已更新")
+	done <- true // 完成扫描
 }
 
 func main() {
-	err := godotenv.Load("config.env")
-	if err != nil {
-		log.Fatal("加载配置文件失败: ", err)
-	}
+	// 获取可执行文件所在目录
+    exePath, err := os.Executable()
+    if err != nil {
+        log.Fatal("无法获取可执行文件路径: ", err)
+    }
+    exeDir := filepath.Dir(exePath)
+    configEnvPath := filepath.Join(exeDir, "config.env") // 拼接完整路径
+
+    log.Println("加载配置文件:", configEnvPath)
+    // 加载配置文件
+    err = godotenv.Load(configEnvPath)
+    if err != nil {
+        log.Fatal("加载配置文件失败: ", err)
+    }
 
 	configPath, err := processPath(os.Getenv("path"))
 	if err != nil {
@@ -154,14 +203,27 @@ func main() {
 		log.Fatal("配置文件中缺少time字段")
 	}
 
-	if err := initDB(); err != nil {
-		log.Fatal("数据库初始化失败:", err)
-	}
+	log.Println("检查数据库是否已存在...")
 
-	// 检查 sql.db 是否存在，如果存在则不执行首次扫描
-	if _, err := os.Stat("./sql.db"); os.IsNotExist(err) {
-		log.Println("执行首次目录扫描...")
-		scanAndSave(configPath)
+	// 获取数据库文件路径
+	dbPath := filepath.Join(exeDir, "sql.db")
+
+	// 检查 sql.db 是否存在，如果存在则跳过首次扫描
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		log.Println("检测到 sql.db 文件不存在，执行首次扫描...")
+		done := make(chan bool)
+
+		// 确保数据库初始化成功
+		if err := initDB(dbPath); err != nil {
+			log.Fatal("数据库初始化失败:", err)
+		}
+
+		// 执行文件扫描
+		go scanAndSave(configPath, dbPath, done)
+
+		// 等待扫描完成
+		<-done
+		log.Println("首次扫描完成，数据库已更新。")
 	} else {
 		log.Println("检测到已存在 sql.db 文件，跳过首次扫描")
 	}
@@ -181,12 +243,18 @@ func main() {
 		log.Fatal("无效的分钟数")
 	}
 
+	log.Printf("设置定时任务，每天 %02d:%02d 执行扫描任务\n", hour, minute)
+
 	// 定时任务
 	cronScheduler := cron.New()
 	cronExp := fmt.Sprintf("%d %d * * *", minute, hour)
 	_, err = cronScheduler.AddFunc(cronExp, func() {
 		log.Println("开始定时文件扫描...")
-		scanAndSave(configPath)
+		done := make(chan bool)
+		go scanAndSave(configPath, dbPath, done)
+
+		// 等待扫描完成
+		<-done
 	})
 	if err != nil {
 		log.Fatal("创建定时任务失败: ", err)
@@ -204,7 +272,7 @@ func main() {
 			return
 		}
 
-		db, err := sql.Open("sqlite", "./sql.db")
+		db, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -218,8 +286,7 @@ func main() {
 				SELECT p.path, f.filename, f.size, f.create_time
 				FROM files f
 				JOIN paths p ON f.path_id = p.id
-				WHERE f.filename LIKE ?
-			`
+				WHERE f.filename LIKE ?`
 		default:
 			http.Error(w, "无效的查询类型", http.StatusBadRequest)
 			return
